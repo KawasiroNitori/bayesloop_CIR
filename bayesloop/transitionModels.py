@@ -15,6 +15,7 @@ from scipy.signal import convolve2d
 from scipy.ndimage.filters import gaussian_filter1d
 from scipy.ndimage.interpolation import shift
 from scipy.stats import multivariate_normal
+from scipy.stats import ncx2  # noncentral chi-square
 from collections.abc import Iterable
 from copy import deepcopy
 from .exceptions import ConfigurationError, PostProcessingError
@@ -909,3 +910,283 @@ class BivariateRandomWalk(TransitionModel):
         kernel = rv.pdf(np.array([xv, yv]).T).T
         kernel /= np.sum(kernel)
         return kernel
+
+
+
+
+# ---------------------------------------------------------------------------
+# CIR-based transition model (Ref by ChatGPT 5)
+# ---------------------------------------------------------------------------
+
+class CIRTransition(TransitionModel):
+    """
+    Parameter changes follow the stationary CIR diffusion:
+        dX_t = kappa (theta - X_t) dt + sigma sqrt(X_t) dW_t   with X_t >= 0.
+
+    One-step transition density is known in closed form via a scaled
+    noncentral chi-square; we discretize it on the target grid and update
+    the prior by direct quadrature (matrix multiply) along the selected axis.
+
+    Hyper-parameters (names are user-definable via name1..name4):
+      - kappa  (>0): mean-reversion speed
+      - theta  (>0): long-run mean (stationary mean)
+      - sigma  (>0): volatility-of-volatility
+      - dt     (>0): time increment between observations (default 1.0)
+
+    Notes
+    -----
+    * Only the 'target' parameter axis is transformed; other axes are left
+      unchanged (delta kernel), matching the pattern of other TMs.
+    * Target grid should be non-negative (CIR support).
+    * Forward update uses K[j,i] ≈ p(x_{t+1}=grid[j] | x_t=grid[i]) * lattice.
+    * Backward update uses the time-reversed kernel B = D_pi K^T D_pi^{-1},
+      where pi is the discretized stationary density of the CIR on the grid.
+    """
+
+    def __init__(self,
+                 name1='kappa', value1=1.0,
+                 name2='theta', value2=1.0,
+                 name3='sigma', value3=0.5,
+                 name4='dt',    value4=1.0,
+                 target=None, prior=(None, None)):
+
+        # Accept array-valued inputs (for HyperStudy/Optimize) like other TMs
+        if isinstance(value1, (list, tuple)): value1 = np.array(value1, dtype=float)
+        if isinstance(value2, (list, tuple)): value2 = np.array(value2, dtype=float)
+        if isinstance(value3, (list, tuple)): value3 = np.array(value3, dtype=float)
+        if isinstance(value4, (list, tuple)): value4 = np.array(value4, dtype=float)
+
+        self.study = None
+        self.latticeConstant = None
+        self.hyperParameterNames  = [name1, name2, name3, name4]
+        self.hyperParameterValues = [value1, value2, value3, value4]
+        self.prior = prior
+        self.selectedParameter = target
+        self.tOffset = 0
+
+        # Caches
+        self._kernel_matrix = None     # forward matrix K (N,N)
+        self._kernel_params = None     # [kappa, theta, sigma, dt]
+        self._cached_axis    = None
+        self._cached_grid    = None
+        self._cached_lattice = None
+
+        self._backward_matrix = None   # backward matrix B (N,N)
+        self._pi              = None   # stationary weights on grid
+        self._pi_params       = None   # [kappa, theta, sigma]
+        self._pi_grid         = None
+
+        if target is None:
+            raise ConfigurationError('No parameter set for transition model "CIRTransition"')
+
+    def __str__(self):
+        return 'CIR transition'
+
+    # --------------------------- CIR math helpers ---------------------------
+
+    @staticmethod
+    def _cir_pdf(x_next, x_cur, kappa, theta, sigma, dt):
+        """
+        Vectorized CIR one-step transition pdf at x_next given x_cur.
+        Uses the noncentral chi-square mapping:
+            phi = exp(-kappa*dt)
+            nu  = 4*kappa*theta/sigma^2
+            c   = sigma^2*(1-phi)/(4*kappa)
+            lam = 4*kappa*phi*x_cur / (sigma^2*(1-phi))
+            X_{t+dt} = c * Y,  Y ~ ncx2(nu, lam)
+            f_X(x | x_cur) = (1/c) * f_ncx2(x/c; df=nu, nc=lam)
+        Shapes:
+            x_next: (N,1), x_cur: (1,N) -> output (N,N)
+        """
+        # numeric guards
+        x_next = np.maximum(x_next, 0.0)
+        x_cur  = np.maximum(x_cur,  0.0)
+
+        phi = np.exp(-kappa * dt)
+        one_minus_phi = np.maximum(1.0 - phi, 1e-14)
+
+        nu  = 4.0 * kappa * theta / (sigma * sigma)
+        c   = (sigma * sigma) * one_minus_phi / (4.0 * kappa)
+        lam = (4.0 * kappa * phi * x_cur) / ((sigma * sigma) * one_minus_phi)
+
+        z = x_next / c
+        dens = ncx2.pdf(z, df=nu, nc=lam) / c
+        return dens
+
+    @staticmethod
+    def _cir_stationary_unnormalized(x, kappa, theta, sigma):
+        """
+        Unnormalized stationary density of CIR (Gamma with mean theta):
+            shape a = 2*kappa*theta/sigma^2, scale b = sigma^2/(2*kappa).
+        We return an unnormalized value and discretely normalize later.
+        """
+        x = np.maximum(x, 0.0)
+        a = 2.0 * kappa * theta / (sigma * sigma)     # shape
+        b = (sigma * sigma) / (2.0 * kappa)           # scale
+        # unnormalized gamma pdf ~ x^{a-1} exp(-x/b)
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            g = np.power(x, np.maximum(a - 1.0, 0.0)) * np.exp(-x / max(b, 1e-300))
+        g[~np.isfinite(g)] = 0.0
+        return g
+
+    # ------------------------ Kernel / matrix builders ----------------------
+
+    def _resolve_axis_grid_lattice(self):
+        """Resolve and return (axis, grid, lattice) for the selected parameter."""
+        axis = self.study.observationModel.parameterNames.index(self.selectedParameter)
+        grid = np.asarray(self.study.parameterGrids[axis], dtype=float)
+        lattice = float(self.latticeConstant[axis])    # assumed uniform
+        return axis, grid, lattice
+
+    def _maybe_rebuild_forward_matrix(self):
+        """Build (or reuse) K[j,i] ≈ p(x_next=grid[j] | x_cur=grid[i]) * lattice."""
+        kappa, theta, sigma, dt = [float(v) for v in self.hyperParameterValues]
+        axis, grid, lattice = self._resolve_axis_grid_lattice()
+
+        need = (
+            self._kernel_matrix is None or
+            self._kernel_params != [kappa, theta, sigma, dt] or
+            self._cached_axis    != axis or
+            self._cached_lattice != lattice or
+            self._cached_grid is None or
+            self._cached_grid.shape != grid.shape or
+            not np.allclose(self._cached_grid, grid)
+        )
+        if not need:
+            return
+
+        N = grid.size
+        x_next = grid[:, None]   # (N,1)
+        x_cur  = grid[None, :]   # (1,N)
+        pdf = self._cir_pdf(x_next, x_cur, kappa, theta, sigma, dt)  # (N,N)
+
+        K = pdf * lattice  # Riemann factor: columns approximate integral weights
+
+        # Column-normalize for numerical stability (preserve mass)
+        col_sums = K.sum(axis=0, keepdims=True)
+        bad = (col_sums <= 0)
+        if np.any(bad):
+            # If a column collapsed numerically, fall back to a delta at nearest cell
+            for i in np.where(bad[0])[0]:
+                K[:, i] = 0.0
+                K[min(i, N-1), i] = 1.0
+        else:
+            K /= col_sums
+
+        self._kernel_matrix = K
+        self._kernel_params = [kappa, theta, sigma, dt]
+        self._cached_axis    = axis
+        self._cached_grid    = grid.copy()
+        self._cached_lattice = lattice
+
+        # Invalidate backward cache (depends on K and pi)
+        self._backward_matrix = None
+
+    def _maybe_rebuild_backward_matrix(self):
+        """
+        Build (or reuse) the time-reversed kernel:
+            B = D_pi K^T D_pi^{-1},
+        where pi is the discretized stationary density on the target grid.
+        """
+        self._maybe_rebuild_forward_matrix()
+        K = self._kernel_matrix
+        kappa, theta, sigma, dt = [float(v) for v in self.hyperParameterValues]
+        axis, grid, lattice = self._cached_axis, self._cached_grid, self._cached_lattice
+
+        # (Re)compute stationary weights pi on the grid if needed
+        need_pi = (
+            self._pi is None or
+            self._pi_params != [kappa, theta, sigma] or
+            self._pi_grid is None or
+            not np.array_equal(self._pi_grid, grid)
+        )
+        if need_pi:
+            pi = self._cir_stationary_unnormalized(grid, kappa, theta, sigma)
+            Z = (pi * lattice).sum()
+            if Z > 0:
+                pi = pi / Z
+            else:
+                # degenerate safeguard: concentrate mass near theta
+                j = np.argmin(np.abs(grid - theta))
+                pi = np.zeros_like(grid)
+                pi[j] = 1.0
+            self._pi = pi
+            self._pi_params = [kappa, theta, sigma]
+            self._pi_grid = grid.copy()
+
+        pi = self._pi
+        # Form B = D_pi K^T D_pi^{-1} without building dense diagonals explicitly
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inv_pi = np.where(pi > 0, 1.0 / pi, 0.0)
+        B = (K.T * pi[np.newaxis, :]) * inv_pi[:, np.newaxis]
+
+        # Column-normalize (numerical guard)
+        col_sums = B.sum(axis=0, keepdims=True)
+        bad = (col_sums <= 0)
+        if np.any(bad):
+            for j in np.where(bad[0])[0]:
+                B[:, j] = 0.0
+                B[j, j] = 1.0
+        else:
+            B /= col_sums
+
+        self._backward_matrix = B
+
+    # ------------------------------ main API ------------------------------- #
+
+    def computeForwardPrior(self, posterior, t):
+        """
+        Prior at t+1 from posterior at t via CIR transition along the target axis:
+            prior_axis = K @ posterior_axis,
+        applied to the last axis (after moving/reshaping like other TMs).
+        """
+        self._maybe_rebuild_forward_matrix()
+        K = self._kernel_matrix
+        axis = self._cached_axis
+
+        arr = np.asarray(posterior, dtype=float)
+        # move target axis to end
+        if axis != arr.ndim - 1:
+            arr = np.moveaxis(arr, axis, -1)
+        leading = arr.shape[:-1]
+        N = arr.shape[-1]
+        arr2 = arr.reshape(-1, N)  # (M, N)
+
+        prior2 = arr2 @ K.T        # (M, N)
+        prior = prior2.reshape(*leading, N)
+        if axis != prior.ndim - 1:
+            prior = np.moveaxis(prior, -1, axis)
+
+        s = prior.sum()
+        if s > 0.0:
+            prior /= s
+        return prior
+
+    def computeBackwardPrior(self, posterior, t):
+        """
+        Prior at t-1 from posterior at t using the time-reversed CIR kernel:
+            prior_axis = B @ posterior_axis,
+        where B = D_pi K^T D_pi^{-1} ensures detailed balance with the
+        CIR stationary density pi on the discretized grid.
+        """
+        self._maybe_rebuild_backward_matrix()
+        B = self._backward_matrix
+        axis = self._cached_axis
+
+        arr = np.asarray(posterior, dtype=float)
+        if axis != arr.ndim - 1:
+            arr = np.moveaxis(arr, axis, -1)
+        leading = arr.shape[:-1]
+        N = arr.shape[-1]
+        arr2 = arr.reshape(-1, N)
+
+        prior2 = arr2 @ B.T
+        prior = prior2.reshape(*leading, N)
+        if axis != prior.ndim - 1:
+            prior = np.moveaxis(prior, -1, axis)
+
+        s = prior.sum()
+        if s > 0.0:
+            prior /= s
+        return prior
+
