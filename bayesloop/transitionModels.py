@@ -1032,10 +1032,43 @@ class CIRTransition(TransitionModel):
     # ------------------------ Kernel / matrix builders ----------------------
 
     def _resolve_axis_grid_lattice(self):
-        """Resolve and return (axis, grid, lattice) for the selected parameter."""
+        """
+        Return (axis, grid_1d, lattice) for the selected parameter.
+        Works for both Study and HyperStudy instances.
+        """
+        # Which axis does the TM act on?
         axis = self.study.observationModel.parameterNames.index(self.selectedParameter)
-        grid = np.asarray(self.study.parameterGrids[axis], dtype=float)
-        lattice = float(self.latticeConstant[axis])    # assumed uniform
+    
+        # Try several places where bayesloop stores the 1D grids
+        grids = None
+        # 1) Newer/typical: Study/HyperStudy keeps the grids as .marginalGrid (list of 1D arrays)
+        if hasattr(self.study, 'marginalGrid') and self.study.marginalGrid:
+            grids = self.study.marginalGrid
+        # 2) Some versions keep them on the observation model
+        elif hasattr(self.study, 'observationModel') and hasattr(self.study.observationModel, 'parameterValues'):
+            grids = self.study.observationModel.parameterValues
+        # 3) Fallback (older code paths you might have): parameterGrids
+        elif hasattr(self.study, 'parameterGrids'):
+            grids = self.study.parameterGrids
+    
+        if grids is None:
+            raise ConfigurationError(
+                'CIRTransition could not find parameter grids on the Study/HyperStudy. '
+                'Expected one of: study.marginalGrid, observationModel.parameterValues, study.parameterGrids.'
+            )
+    
+        grid = np.asarray(grids[axis], dtype=float)
+    
+        # Lattice constants are already injected by bayesloop when the TM is attached
+        if self.latticeConstant is None:
+            raise ConfigurationError('latticeConstant not set on transition model.')
+        lattice = float(self.latticeConstant[axis])
+    
+        # (Optional) Guard for CIR support
+        if grid.min() < 0:
+            raise ConfigurationError(
+                f'CIRTransition requires a non-negative grid for "{self.selectedParameter}". Got min={grid.min():.3g}.'
+            )
         return axis, grid, lattice
 
     def _maybe_rebuild_forward_matrix(self):
