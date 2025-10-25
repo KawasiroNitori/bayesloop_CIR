@@ -948,7 +948,7 @@ class CIRTransition(TransitionModel):
                  name2='theta', value2=1.0,
                  name3='sigma', value3=0.5,
                  name4='dt',    value4=1.0,
-                 target=None, prior=(None, None)):
+                 target=None, prior=(None, None, None, None)):
 
         # Accept array-valued inputs (for HyperStudy/Optimize) like other TMs
         if isinstance(value1, (list, tuple)): value1 = np.array(value1, dtype=float)
