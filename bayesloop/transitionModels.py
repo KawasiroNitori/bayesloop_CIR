@@ -915,7 +915,7 @@ class BivariateRandomWalk(TransitionModel):
 
 
 # ---------------------------------------------------------------------------
-# CIR-based transition model (Ref by ChatGPT 5)
+# CIR-based transition model (Ref by ChatGPT 5; Only for 1 target, like DD)
 # ---------------------------------------------------------------------------
 
 class CIRTransition(TransitionModel):
