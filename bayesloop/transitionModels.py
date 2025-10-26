@@ -1075,12 +1075,13 @@ class CIRTransition(TransitionModel):
         """Build (or reuse) K[j,i] ≈ p(x_next=grid[j] | x_cur=grid[i]) * lattice."""
         kappa, theta, sigma, dt = [float(v) for v in self.hyperParameterValues]
         axis, grid, lattice = self._resolve_axis_grid_lattice()
-
+        new_params = (kappa, theta, sigma, dt)
         need = (
             self._kernel_matrix is None or
             self._kernel_params != [kappa, theta, sigma, dt] or
+            any( not np.isclose(a, b, rtol=1e-12, atol=1e-15) for a, b in zip(self._kernel_params, new_params)) or
             self._cached_axis    != axis or
-            self._cached_lattice != lattice or
+            not np.isclose(self._cached_lattice, lattice, rtol=1e-12, atol=1e-15) or
             self._cached_grid is None or
             self._cached_grid.shape != grid.shape or
             not np.allclose(self._cached_grid, grid)
@@ -1125,11 +1126,13 @@ class CIRTransition(TransitionModel):
         K = self._kernel_matrix
         kappa, theta, sigma, dt = [float(v) for v in self.hyperParameterValues]
         axis, grid, lattice = self._cached_axis, self._cached_grid, self._cached_lattice
-
+        new_params_B = (kappa, theta, sigma, dt)
+        
         # (Re)compute stationary weights pi on the grid if needed
         need_pi = (
             self._pi is None or
-            self._pi_params != [kappa, theta, sigma] or
+            any( not np.isclose(a, b, rtol=1e-12, atol=1e-15) for a, b in zip(self._pi_params, new_params_B)) or
+            # self._pi_params != [kappa, theta, sigma] or
             self._pi_grid is None or
             not np.array_equal(self._pi_grid, grid)
         )
