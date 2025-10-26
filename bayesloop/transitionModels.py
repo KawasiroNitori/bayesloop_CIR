@@ -1098,16 +1098,16 @@ class CIRTransition(TransitionModel):
 
         # Column-normalize for numerical stability (preserve mass)
         col_sums = K.sum(axis=0, keepdims=True)
-        good = (col_sums > 0.0)
-        bad  = ~good
+        bad = (col_sums <= 0)
+        
         if np.any(bad):
-            # If a column collapsed numerically, fall back to a delta at nearest cell
             for i in np.where(bad[0])[0]:
                 K[:, i] = 0.0
                 K[min(i, N-1), i] = 1.0
-            col_sums[:, bad_idx] = 1.0
-            good = (col_sums > 0.0)  # (now all columns are "good")
-
+            # recompute col_sums after repair
+            col_sums = K.sum(axis=0, keepdims=True)
+            
+        col_sums = np.maximum(col_sums, 1e-300)
         K /= col_sums
 
         self._kernel_matrix = K
@@ -1163,12 +1163,14 @@ class CIRTransition(TransitionModel):
         col_sums = B.sum(axis=0, keepdims=True)
         bad = (col_sums <= 0)
         if np.any(bad):
+            N = B.shape[0]
             for j in np.where(bad[0])[0]:
                 B[:, j] = 0.0
-                B[j, j] = 1.0
-        else:
-            B /= col_sums
-
+                B[min(j, N-1), j] = 1.0
+            col_sums = B.sum(axis=0, keepdims=True)
+            
+        col_sums = np.maximum(col_sums, 1e-300)
+        B /= col_sums
         self._backward_matrix = B
 
     # ------------------------------ main API ------------------------------- #
