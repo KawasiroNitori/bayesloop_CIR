@@ -1078,7 +1078,7 @@ class CIRTransition(TransitionModel):
         new_params = (kappa, theta, sigma, dt)
         need = (
             self._kernel_matrix is None or
-            self._kernel_params != [kappa, theta, sigma, dt] or
+            # self._kernel_params != [kappa, theta, sigma, dt] or
             any( not np.isclose(a, b, rtol=1e-12, atol=1e-15) for a, b in zip(self._kernel_params, new_params)) or
             self._cached_axis    != axis or
             not np.isclose(self._cached_lattice, lattice, rtol=1e-12, atol=1e-15) or
