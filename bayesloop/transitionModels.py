@@ -1098,19 +1098,18 @@ class CIRTransition(TransitionModel):
 
         # Column-normalize for numerical stability (preserve mass)
         col_sums = K.sum(axis=0, keepdims=True)
-        good = (col_sums > 0.0)
-        bad  = ~good
+        bad = (col_sums <= 0)
+        
         if np.any(bad):
-            # If a column collapsed numerically, fall back to a delta at nearest cell
             for i in np.where(bad[0])[0]:
                 K[:, i] = 0.0
                 K[min(i, N-1), i] = 1.0
-            col_sums[:, bad_idx] = 1.0
-            good = (col_sums > 0.0)  # (now all columns are "good")
-
+            # recompute col_sums after repair
+            col_sums = K.sum(axis=0, keepdims=True)
+            
+        col_sums = np.maximum(col_sums, 1e-300)
         K /= col_sums
-
-        self._kernel_matrix = K
+        self._kernel_matrix = np.asfortranarray(K)
         self._kernel_params = [kappa, theta, sigma, dt]
         self._cached_axis    = axis
         self._cached_grid    = grid.copy()
@@ -1134,6 +1133,7 @@ class CIRTransition(TransitionModel):
         # (Re)compute stationary weights pi on the grid if needed
         need_pi = (
             self._pi is None or
+            self._pi_params is None or
             any( not np.isclose(a, b, rtol=1e-12, atol=1e-15) for a, b in zip(self._pi_params, new_params_B)) or
             # self._pi_params != [kappa, theta, sigma] or
             self._pi_grid is None or
@@ -1141,14 +1141,18 @@ class CIRTransition(TransitionModel):
         )
         if need_pi:
             pi = self._cir_stationary_unnormalized(grid, kappa, theta, sigma)
-            Z = (pi * lattice).sum()
-            if Z > 0:
-                pi = pi / Z
-            else:
-                # degenerate safeguard: concentrate mass near theta
-                j = np.argmin(np.abs(grid - theta))
-                pi = np.zeros_like(grid)
-                pi[j] = 1.0
+            pi = np.maximum(pi, 1e-300)
+            Z = float((pi * lattice).sum())
+            pi = pi / Z if Z > 0 else np.eye(grid.size, dtype=float)[:, 0]  # ultra-safe fallback
+
+            # Z = (pi * lattice).sum()
+            # if Z > 0:
+            #     pi = pi / Z
+            # else:
+            #     # degenerate safeguard: concentrate mass near theta
+            #     j = np.argmin(np.abs(grid - theta))
+            #     pi = np.zeros_like(grid)
+            #     pi[j] = 1.0
             self._pi = pi
             self._pi_params = [kappa, theta, sigma]
             self._pi_grid = grid.copy()
@@ -1157,19 +1161,22 @@ class CIRTransition(TransitionModel):
         # Form B = D_pi K^T D_pi^{-1} without building dense diagonals explicitly
         with np.errstate(divide='ignore', invalid='ignore'):
             inv_pi = np.where(pi > 0, 1.0 / pi, 0.0)
+            
         B = (K.T * pi[np.newaxis, :]) * inv_pi[:, np.newaxis]
 
         # Column-normalize (numerical guard)
         col_sums = B.sum(axis=0, keepdims=True)
         bad = (col_sums <= 0)
         if np.any(bad):
+            N = B.shape[0]
             for j in np.where(bad[0])[0]:
                 B[:, j] = 0.0
-                B[j, j] = 1.0
-        else:
-            B /= col_sums
-
-        self._backward_matrix = B
+                B[min(j, N-1), j] = 1.0
+            col_sums = B.sum(axis=0, keepdims=True)
+            
+        col_sums = np.maximum(col_sums, 1e-300)
+        B /= col_sums
+        self._backward_matrix = np.asfortranarray(B)
 
     # ------------------------------ main API ------------------------------- #
 
@@ -1189,8 +1196,8 @@ class CIRTransition(TransitionModel):
             arr = np.moveaxis(arr, axis, -1)
         leading = arr.shape[:-1]
         N = arr.shape[-1]
-        arr2 = arr.reshape(-1, N)  # (M, N)
-
+        # arr2 = arr.reshape(-1, N)  # (M, N)
+        arr2 = np.ascontiguousarray(arr.reshape(-1, N))  # C-major for GEMM
         prior2 = arr2 @ K.T        # (M, N)
         prior = prior2.reshape(*leading, N)
         if axis != prior.ndim - 1:
@@ -1217,8 +1224,8 @@ class CIRTransition(TransitionModel):
             arr = np.moveaxis(arr, axis, -1)
         leading = arr.shape[:-1]
         N = arr.shape[-1]
-        arr2 = arr.reshape(-1, N)
-
+        
+        arr2   = np.ascontiguousarray(arr.reshape(-1, N)) 
         prior2 = arr2 @ B.T
         prior = prior2.reshape(*leading, N)
         if axis != prior.ndim - 1:
