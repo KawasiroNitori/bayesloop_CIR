@@ -11,7 +11,7 @@ Forked version of Bayesloop package, especially for diffusing diffusivity with C
 ## Installation
 I checked it works with python ver=3.12.
 But the installation should be done by
-``
+```
 pip install git+https://github.com/christophmark/bayesloop
 ```
 not by pure pip install.
