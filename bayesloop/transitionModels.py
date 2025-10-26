@@ -1255,7 +1255,7 @@ class CIRTransition(TransitionModel):
             arr2_gpu   = cp.asarray(arr2)               # upload batch only
             prior2_gpu = arr2_gpu @ self._KT_gpu        # GPU GEMM
             prior2     = cp.asnumpy(prior2_gpu)         # download result
-        else:]
+        else:
             prior2     = arr2 @ self._kernel_matrix.T   # CPU BLAS    
             
         # prior2 = arr2 @ K.T        # (M, N)
