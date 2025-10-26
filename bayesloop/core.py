@@ -345,19 +345,22 @@ class Study(object):
 
         if not silent:
             print('+ Started new fit:')
-
-        self.formattedData = movingWindow(self.rawData, self.observationModel.segmentLength)
-        self.formattedTimestamps = self.rawTimestamps[self.observationModel.segmentLength-1:]
+        
+        # 현재는 segment length=1 (independent Obsv)만 지원됨
+        self.formattedData = movingWindow(self.rawData, self.observationModel.segmentLength)  # Just rawData, ndarray
+        self.formattedTimestamps = self.rawTimestamps[self.observationModel.segmentLength-1:] # Just rawTimestamps
         if not silent:
             print('    + Formatted data.')
 
         # initialize array for posterior distributions
+        # 각 시간별로 OM parameter grid 생성
         if not evidenceOnly:
-            self.posteriorSequence = np.empty([len(self.formattedData)]+self.gridSize)
+            self.posteriorSequence = np.empty([len(self.formattedData)]+self.gridSize)  # (T, param1_grid, param2_grid, ...)
 
         # initialize array for computed evidence (marginal likelihood)
         self.logEvidence = 0
-        self.localEvidence = np.empty(len(self.formattedData))
+        # local Evidence: 
+        self.localEvidence = np.empty(len(self.formattedData)) # (T, )
 
         # set prior distribution for forward-pass
         alpha = self._computePrior(silent=silent)
