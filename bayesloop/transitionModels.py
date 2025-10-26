@@ -25,6 +25,15 @@ try:
 except ImportError:
     from inspect import getfullargspec as getargspec
 
+# GPU availibility check
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cpx_sparse
+    _HAS_CUPY = True
+except Exception:
+    _HAS_CUPY = False
+
+
 class TransitionModel:
     """
     Parent class for transition models. All transition models inherit from this class. It is currently only used to
@@ -975,7 +984,15 @@ class CIRTransition(TransitionModel):
         self._pi              = None   # stationary weights on grid
         self._pi_params       = None   # [kappa, theta, sigma]
         self._pi_grid         = None
-
+                     
+        self.use_gpu = _HAS_CUPY
+        self._K_gpu = None
+        self._KT_gpu = None
+        self._gpu_kernel_valid = False
+        self._B_gpu = None                   # Fortran-order on device
+        self._BT_gpu = None                  # C-order transpose on device
+        self._gpu_backward_valid = False
+                     
         if target is None:
             raise ConfigurationError('No parameter set for transition model "CIRTransition"')
 
@@ -1071,6 +1088,37 @@ class CIRTransition(TransitionModel):
             )
         return axis, grid, lattice
 
+    # Determine whether cp.asarray() should be used or not
+    
+    def _ensure_gpu_kernel(self):
+        if not _HAS_CUPY or not self.use_gpu: # no GPU implementation
+            return False
+        import cupy as cp
+        if self._gpu_kernel_valid and self._K_gpu is not None and self._KT_gpu is not None: # No need to rebuild
+            return True
+        # Upload once per rebuild
+        K_cpu = self._kernel_matrix 
+        if K_cpu is None:
+            return False
+        self._K_gpu  = cp.asarray(K_cpu, order='F')          # Fortran on device
+        self._KT_gpu = cp.ascontiguousarray(self._K_gpu.T)   # C-order transpose on device
+        self._gpu_kernel_valid = True
+        return True
+
+    def _ensure_gpu_backward(self):
+        if not self.use_gpu:
+            return False
+        import cupy as cp  # safe: only import if needed
+        if self._gpu_backward_valid and self._B_gpu is not None and self._BT_gpu is not None:
+            return True
+        B_cpu = self._backward_matrix
+        if B_cpu is None:
+            return False
+        self._B_gpu  = cp.asarray(B_cpu, order='F')          # Fortran on device
+        self._BT_gpu = cp.ascontiguousarray(self._B_gpu.T)   # C-order transpose
+        self._gpu_backward_valid = True
+        return True
+        
     def _maybe_rebuild_forward_matrix(self):
         """Build (or reuse) K[j,i] ≈ p(x_next=grid[j] | x_cur=grid[i]) * lattice."""
         kappa, theta, sigma, dt = [float(v) for v in self.hyperParameterValues]
@@ -1078,6 +1126,7 @@ class CIRTransition(TransitionModel):
         new_params = (kappa, theta, sigma, dt)
         need = (
             self._kernel_matrix is None or
+            self._kernel_params is None or
             # self._kernel_params != [kappa, theta, sigma, dt] or
             any( not np.isclose(a, b, rtol=1e-12, atol=1e-15) for a, b in zip(self._kernel_params, new_params)) or
             self._cached_axis    != axis or
@@ -1109,8 +1158,8 @@ class CIRTransition(TransitionModel):
             
         col_sums = np.maximum(col_sums, 1e-300)
         K /= col_sums
-
-        self._kernel_matrix = K
+    
+        self._kernel_matrix = np.asfortranarray(K)
         self._kernel_params = [kappa, theta, sigma, dt]
         self._cached_axis    = axis
         self._cached_grid    = grid.copy()
@@ -1118,7 +1167,12 @@ class CIRTransition(TransitionModel):
 
         # Invalidate backward cache (depends on K and pi)
         self._backward_matrix = None
-
+        
+        # invalidate GPU copies
+        self._gpu_kernel_valid = False
+        self._K_gpu = None
+        self._KT_gpu = None
+        
     def _maybe_rebuild_backward_matrix(self):
         """
         Build (or reuse) the time-reversed kernel:
@@ -1129,12 +1183,13 @@ class CIRTransition(TransitionModel):
         K = self._kernel_matrix
         kappa, theta, sigma, dt = [float(v) for v in self.hyperParameterValues]
         axis, grid, lattice = self._cached_axis, self._cached_grid, self._cached_lattice
-        new_params_B = (kappa, theta, sigma, dt)
+        new_pi_params = (kappa, theta, sigma)
         
         # (Re)compute stationary weights pi on the grid if needed
         need_pi = (
             self._pi is None or
-            any( not np.isclose(a, b, rtol=1e-12, atol=1e-15) for a, b in zip(self._pi_params, new_params_B)) or
+            self._pi_params is None or
+            any( not np.isclose(a, b, rtol=1e-12, atol=1e-15) for a, b in zip(self._pi_params, new_pi_params)) or
             # self._pi_params != [kappa, theta, sigma] or
             self._pi_grid is None or
             not np.array_equal(self._pi_grid, grid)
@@ -1171,8 +1226,11 @@ class CIRTransition(TransitionModel):
             
         col_sums = np.maximum(col_sums, 1e-300)
         B /= col_sums
-        self._backward_matrix = B
-
+        self._backward_matrix = np.asfortranarray(B)
+        # invalidate GPU copies
+        self._gpu_backward_valid = False
+        self._B_gpu = None
+        self._BT_gpu = None
     # ------------------------------ main API ------------------------------- #
 
     def computeForwardPrior(self, posterior, t):
@@ -1191,9 +1249,16 @@ class CIRTransition(TransitionModel):
             arr = np.moveaxis(arr, axis, -1)
         leading = arr.shape[:-1]
         N = arr.shape[-1]
-        arr2 = arr.reshape(-1, N)  # (M, N)
+        arr2 = np.ascontiguousarray(arr.reshape(-1, N))
 
-        prior2 = arr2 @ K.T        # (M, N)
+        if self._ensure_gpu_kernel():
+            arr2_gpu   = cp.asarray(arr2)               # upload batch only
+            prior2_gpu = arr2_gpu @ self._KT_gpu        # GPU GEMM
+            prior2     = cp.asnumpy(prior2_gpu)         # download result
+        else:]
+            prior2     = arr2 @ self._kernel_matrix.T   # CPU BLAS    
+            
+        # prior2 = arr2 @ K.T        # (M, N)
         prior = prior2.reshape(*leading, N)
         if axis != prior.ndim - 1:
             prior = np.moveaxis(prior, -1, axis)
@@ -1219,10 +1284,20 @@ class CIRTransition(TransitionModel):
             arr = np.moveaxis(arr, axis, -1)
         leading = arr.shape[:-1]
         N = arr.shape[-1]
-        arr2 = arr.reshape(-1, N)
+        arr2 = np.ascontiguousarray(arr.reshape(-1, N))
+        
+        if self._ensure_gpu_backward():
+            # import cupy as cp
+            arr2_gpu   = cp.asarray(arr2)          # upload batch only
+            prior2_gpu = arr2_gpu @ self._BT_gpu   # GEMM on GPU
+            prior2     = cp.asnumpy(prior2_gpu)    # download result
+        else:
+            prior2 = arr2 @ self._backward_matrix.T                    # CPU BLAS
 
-        prior2 = arr2 @ B.T
+            
+        # prior2 = arr2 @ B.T
         prior = prior2.reshape(*leading, N)
+    
         if axis != prior.ndim - 1:
             prior = np.moveaxis(prior, -1, axis)
 
