@@ -1100,8 +1100,9 @@ class CIRTransition(TransitionModel):
         K_cpu = self._kernel_matrix 
         if K_cpu is None:
             return False
-        self._K_gpu  = cp.asarray(K_cpu, order='F')          # Fortran on device
-        self._KT_gpu = cp.ascontiguousarray(self._K_gpu.T)   # C-order transpose on device
+        # self._K_gpu  = cp.asarray(K_cpu, order='F')          # Fortran on device
+        # self._KT_gpu = cp.ascontiguousarray(self._K_gpu.T)   # C-order transpose on device
+        self._K_gpu  = cp.asarray(K_cpu) 
         self._gpu_kernel_valid = True
         return True
 
@@ -1114,8 +1115,10 @@ class CIRTransition(TransitionModel):
         B_cpu = self._backward_matrix
         if B_cpu is None:
             return False
-        self._B_gpu  = cp.asarray(B_cpu, order='F')          # Fortran on device
-        self._BT_gpu = cp.ascontiguousarray(self._B_gpu.T)   # C-order transpose
+        # self._B_gpu  = cp.asarray(B_cpu, order='F')          # Fortran on device
+        # self._BT_gpu = cp.ascontiguousarray(self._B_gpu.T)   # C-order transpose
+        self._B_gpu  = cp.asarray(B_cpu)        
+        # self._BT_gpu = cp.ascontiguousarray(self._B_gpu.T)  
         self._gpu_backward_valid = True
         return True
         
@@ -1159,7 +1162,8 @@ class CIRTransition(TransitionModel):
         col_sums = np.maximum(col_sums, 1e-300)
         K /= col_sums
     
-        self._kernel_matrix = np.asfortranarray(K)
+        # self._kernel_matrix = np.asfortranarray(K)
+        self._kernel_matrix = K
         self._kernel_params = [kappa, theta, sigma, dt]
         self._cached_axis    = axis
         self._cached_grid    = grid.copy()
@@ -1226,7 +1230,8 @@ class CIRTransition(TransitionModel):
             
         col_sums = np.maximum(col_sums, 1e-300)
         B /= col_sums
-        self._backward_matrix = np.asfortranarray(B)
+        # self._backward_matrix = np.asfortranarray(B)
+        self._backward_matrix = B
         # invalidate GPU copies
         self._gpu_backward_valid = False
         self._B_gpu = None
@@ -1240,7 +1245,7 @@ class CIRTransition(TransitionModel):
         applied to the last axis (after moving/reshaping like other TMs).
         """
         self._maybe_rebuild_forward_matrix()
-        K = self._kernel_matrix
+        # K = self._kernel_matrix
         axis = self._cached_axis
 
         arr = np.asarray(posterior, dtype=float)
@@ -1249,11 +1254,12 @@ class CIRTransition(TransitionModel):
             arr = np.moveaxis(arr, axis, -1)
         leading = arr.shape[:-1]
         N = arr.shape[-1]
-        arr2 = np.ascontiguousarray(arr.reshape(-1, N))
+        # arr2 = np.ascontiguousarray(arr.reshape(-1, N))
+        arr2 = arr.reshape(-1, N)
 
         if self._ensure_gpu_kernel():
             arr2_gpu   = cp.asarray(arr2)               # upload batch only
-            prior2_gpu = arr2_gpu @ self._KT_gpu        # GPU GEMM
+            prior2_gpu = arr2_gpu @ self._K_gpu.T         # GPU GEMM
             prior2     = cp.asnumpy(prior2_gpu)         # download result
         else:
             prior2     = arr2 @ self._kernel_matrix.T   # CPU BLAS    
@@ -1276,7 +1282,7 @@ class CIRTransition(TransitionModel):
         CIR stationary density pi on the discretized grid.
         """
         self._maybe_rebuild_backward_matrix()
-        B = self._backward_matrix
+        # B = self._backward_matrix
         axis = self._cached_axis
 
         arr = np.asarray(posterior, dtype=float)
@@ -1284,12 +1290,13 @@ class CIRTransition(TransitionModel):
             arr = np.moveaxis(arr, axis, -1)
         leading = arr.shape[:-1]
         N = arr.shape[-1]
-        arr2 = np.ascontiguousarray(arr.reshape(-1, N))
+        # arr2 = np.ascontiguousarray(arr.reshape(-1, N))
+        arr2 = arr.reshape(-1, N)
         
         if self._ensure_gpu_backward():
             # import cupy as cp
             arr2_gpu   = cp.asarray(arr2)          # upload batch only
-            prior2_gpu = arr2_gpu @ self._BT_gpu   # GEMM on GPU
+            prior2_gpu = arr2_gpu @ self._B_gpu.T   # GEMM on GPU
             prior2     = cp.asnumpy(prior2_gpu)    # download result
         else:
             prior2 = arr2 @ self._backward_matrix.T                    # CPU BLAS
