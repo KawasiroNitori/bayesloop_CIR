@@ -957,7 +957,7 @@ class CIRTransition(TransitionModel):
                  name2='theta', value2=1.0,
                  name3='sigma', value3=0.5,
                  name4='dt',    value4=1.0,
-                 target=None, prior=(None, None, None, None)):
+                 target=None, prior=(None, None, None, None), gpu=True):
 
         # Accept array-valued inputs (for HyperStudy/Optimize) like other TMs
         if isinstance(value1, (list, tuple)): value1 = np.array(value1, dtype=float)
@@ -985,7 +985,7 @@ class CIRTransition(TransitionModel):
         self._pi_params       = None   # [kappa, theta, sigma]
         self._pi_grid         = None
                      
-        self.use_gpu = _HAS_CUPY
+        self.use_gpu = (_HAS_CUPY and gpu)
         self._K_gpu = None
         self._KT_gpu = None
         self._gpu_kernel_valid = False
